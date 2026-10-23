@@ -1,6 +1,8 @@
 import express, { Request, Response } from "express";
 import cors from "cors";
 import helmet from "helmet";
+import { authRouter } from "./routes/auth";
+import { assignmentRouter } from "./routes/assignments";
 
 export const app = express();
 
@@ -22,4 +24,13 @@ app.get("/api/health", (_req: Request, res: Response) => {
     service: "blocksubmit-backend",
     version: "1.0.0",
   });
+});
+
+// Mount domain routes under /api
+app.use("/api/auth", authRouter);
+app.use("/api/assignments", assignmentRouter);
+
+// 404 handler for unhandled /api routes
+app.use("/api", (_req: Request, res: Response) => {
+  res.status(404).json({ message: "API endpoint not found" });
 });
