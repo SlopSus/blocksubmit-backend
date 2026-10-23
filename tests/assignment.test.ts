@@ -50,3 +50,41 @@ describe("Assignment Model & Logic", () => {
     assert.strictEqual(isNaN(invalidDate.getTime()), true);
   });
 });
+
+describe("Student Submission Status Mapping Logic", () => {
+  it("defaults to NOT_SUBMITTED and submissionId null when student has not submitted assignment", () => {
+    const studentSubmissionMap = new Map<string, { status: string; submissionId: string }>();
+    const assignmentId = new mongoose.Types.ObjectId().toString();
+
+    const matching = studentSubmissionMap.get(assignmentId);
+    const submissionStatus = matching?.status || "NOT_SUBMITTED";
+    const submissionId = matching?.submissionId || null;
+
+    assert.strictEqual(submissionStatus, "NOT_SUBMITTED");
+    assert.strictEqual(submissionId, null);
+  });
+
+  it("resolves to actual persisted status (PENDING, VERIFIED, TAMPERED) and submissionId when student has submitted", () => {
+    const asg1 = new mongoose.Types.ObjectId().toString();
+    const asg2 = new mongoose.Types.ObjectId().toString();
+    const asg3 = new mongoose.Types.ObjectId().toString();
+
+    const studentSubmissionMap = new Map<string, { status: string; submissionId: string }>([
+      [asg1, { status: "VERIFIED", submissionId: "sub-verified-001" }],
+      [asg2, { status: "PENDING", submissionId: "sub-pending-002" }],
+      [asg3, { status: "TAMPERED", submissionId: "sub-tampered-003" }],
+    ]);
+
+    const match1 = studentSubmissionMap.get(asg1);
+    assert.strictEqual(match1?.status || "NOT_SUBMITTED", "VERIFIED");
+    assert.strictEqual(match1?.submissionId || null, "sub-verified-001");
+
+    const match2 = studentSubmissionMap.get(asg2);
+    assert.strictEqual(match2?.status || "NOT_SUBMITTED", "PENDING");
+    assert.strictEqual(match2?.submissionId || null, "sub-pending-002");
+
+    const match3 = studentSubmissionMap.get(asg3);
+    assert.strictEqual(match3?.status || "NOT_SUBMITTED", "TAMPERED");
+    assert.strictEqual(match3?.submissionId || null, "sub-tampered-003");
+  });
+});

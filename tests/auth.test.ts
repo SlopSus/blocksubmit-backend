@@ -75,3 +75,77 @@ describe("JWT Authentication & Token Security", () => {
     });
   });
 });
+
+describe("User Provisioning & Update Validation", () => {
+  it("validates valid input for new user provisioning", async () => {
+    const { validateProvisionInput } = await import("../src/scripts/create-user");
+    const result = validateProvisionInput({
+      email: "professor@blocksubmit.edu",
+      password: "validPassword123",
+      name: "Dr. Ananya Rao",
+      role: "professor",
+    });
+    assert.strictEqual(result.valid, true);
+  });
+
+  it("requires name when allowUpdate is false", async () => {
+    const { validateProvisionInput } = await import("../src/scripts/create-user");
+    const result = validateProvisionInput({
+      email: "professor@blocksubmit.edu",
+      password: "validPassword123",
+      allowUpdate: false,
+    });
+    assert.strictEqual(result.valid, false);
+    assert.match(result.error || "", /name must be at least 2 characters/i);
+  });
+
+  it("permits omitting name when allowUpdate is true", async () => {
+    const { validateProvisionInput } = await import("../src/scripts/create-user");
+    const result = validateProvisionInput({
+      email: "professor@blocksubmit.edu",
+      password: "validPassword123",
+      allowUpdate: true,
+    });
+    assert.strictEqual(result.valid, true);
+  });
+
+  it("rejects password shorter than 4 chars or longer than 72 chars", async () => {
+    const { validateProvisionInput } = await import("../src/scripts/create-user");
+    const shortResult = validateProvisionInput({
+      email: "professor@blocksubmit.edu",
+      password: "123",
+      name: "Professor",
+    });
+    assert.strictEqual(shortResult.valid, false);
+
+    const longResult = validateProvisionInput({
+      email: "professor@blocksubmit.edu",
+      password: "a".repeat(73),
+      name: "Professor",
+    });
+    assert.strictEqual(longResult.valid, false);
+  });
+
+  it("updates existing user password hash and verifies candidate password", async () => {
+    const oldPassword = "oldPassword123";
+    const newPassword = "newSecurePassword456";
+
+    const user = new User({
+      name: "Test Professor",
+      email: "professor@blocksubmit.edu",
+      passwordHash: await bcrypt.hash(oldPassword, 10),
+      role: "professor",
+      initials: "TP",
+      department: "Computer Science",
+    });
+
+    assert.strictEqual(await user.comparePassword(oldPassword), true);
+    assert.strictEqual(await user.comparePassword(newPassword), false);
+
+    // Simulate password update with salt rounds 10
+    user.passwordHash = await bcrypt.hash(newPassword, 10);
+
+    assert.strictEqual(await user.comparePassword(newPassword), true);
+    assert.strictEqual(await user.comparePassword(oldPassword), false);
+  });
+});

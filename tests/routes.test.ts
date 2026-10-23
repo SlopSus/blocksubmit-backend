@@ -270,4 +270,76 @@ describe("API Route Integration & Security Tests", () => {
       assert.strictEqual(statusCode, 401);
     });
   });
+
+  describe("CORS Security & Preflight Configuration", () => {
+    it("handles preflight OPTIONS request for frontend origin http://localhost:8080", async () => {
+      const res = await fetch(`${baseUrl}/api/auth/login`, {
+        method: "OPTIONS",
+        headers: {
+          "Origin": "http://localhost:8080",
+          "Access-Control-Request-Method": "POST",
+          "Access-Control-Request-Headers": "Content-Type",
+        },
+      });
+
+      assert.strictEqual(res.status, 204);
+      assert.strictEqual(res.headers.get("access-control-allow-origin"), "http://localhost:8080");
+      assert.strictEqual(res.headers.get("access-control-allow-credentials"), "true");
+      assert.match(res.headers.get("access-control-allow-methods") || "", /POST/);
+    });
+
+    it("handles preflight OPTIONS request for legacy frontend origin http://localhost:3000", async () => {
+      const res = await fetch(`${baseUrl}/api/auth/login`, {
+        method: "OPTIONS",
+        headers: {
+          "Origin": "http://localhost:3000",
+          "Access-Control-Request-Method": "POST",
+          "Access-Control-Request-Headers": "Content-Type",
+        },
+      });
+
+      assert.strictEqual(res.status, 204);
+      assert.strictEqual(res.headers.get("access-control-allow-origin"), "http://localhost:3000");
+      assert.strictEqual(res.headers.get("access-control-allow-credentials"), "true");
+    });
+
+    it("dynamically respects FRONTEND_URL environment variable", async () => {
+      const original = process.env.FRONTEND_URL;
+      try {
+        process.env.FRONTEND_URL = "http://custom-frontend.internal:9000";
+        const res = await fetch(`${baseUrl}/api/auth/login`, {
+          method: "OPTIONS",
+          headers: {
+            "Origin": "http://custom-frontend.internal:9000",
+            "Access-Control-Request-Method": "POST",
+          },
+        });
+
+        assert.strictEqual(res.status, 204);
+        assert.strictEqual(
+          res.headers.get("access-control-allow-origin"),
+          "http://custom-frontend.internal:9000"
+        );
+        assert.strictEqual(res.headers.get("access-control-allow-credentials"), "true");
+      } finally {
+        if (original === undefined) {
+          delete process.env.FRONTEND_URL;
+        } else {
+          process.env.FRONTEND_URL = original;
+        }
+      }
+    });
+
+    it("rejects unauthorized origins by omitting Access-Control-Allow-Origin", async () => {
+      const res = await fetch(`${baseUrl}/api/auth/login`, {
+        method: "OPTIONS",
+        headers: {
+          "Origin": "http://malicious-site.evil",
+          "Access-Control-Request-Method": "POST",
+        },
+      });
+
+      assert.strictEqual(res.headers.get("access-control-allow-origin"), null);
+    });
+  });
 });

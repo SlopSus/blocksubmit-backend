@@ -1,6 +1,7 @@
 import { Router, Request, Response } from "express";
 import mongoose from "mongoose";
 import { Assignment, generateAssignmentCode, AssignmentStatus } from "../models/Assignment";
+import { Submission } from "../models/Submission";
 import { authenticateJWT, requireRole } from "../middleware/auth";
 
 export const assignmentRouter = Router();
@@ -16,6 +17,7 @@ export interface AssignmentResponse {
   requirements: string[];
   createdAt: string | null;
   submissionStatus?: string;
+  submissionId?: string | null;
 }
 
 // GET /api/assignments - Authenticated users can list assignments
@@ -23,11 +25,34 @@ assignmentRouter.get("/", authenticateJWT, async (req: Request, res: Response): 
   try {
     const assignments = await Assignment.find().sort({ createdAt: -1 });
     const userRole = req.user?.role;
+    const studentId = req.user?._id;
+
+    // For student requests, retrieve their existing submissions to accurately report submission status and submissionId
+    const studentSubmissionMap = new Map<string, { status: string; submissionId: string }>();
+    if (userRole === "student" && studentId) {
+      const studentSubmissions = await Submission.find({ studentRef: studentId })
+        .sort({ submittedAt: -1 })
+        .select("submissionId assignmentId assignmentRef status");
+
+      for (const sub of studentSubmissions) {
+        const idKey = sub.assignmentId || sub.assignmentRef?.toString();
+        if (idKey && !studentSubmissionMap.has(idKey)) {
+          studentSubmissionMap.set(idKey, {
+            status: sub.status,
+            submissionId: sub.submissionId || sub._id.toString(),
+          });
+        }
+      }
+    }
 
     const formatted: AssignmentResponse[] = assignments.map((a) => {
       const json = a.toJSON() as unknown as AssignmentResponse;
       if (userRole === "student") {
-        json.submissionStatus = "NOT_SUBMITTED";
+        const matching =
+          studentSubmissionMap.get(json.id) ||
+          studentSubmissionMap.get(a._id.toString());
+        json.submissionStatus = matching?.status || "NOT_SUBMITTED";
+        json.submissionId = matching?.submissionId || null;
       }
       return json;
     });
@@ -121,8 +146,14 @@ assignmentRouter.get("/:id", authenticateJWT, async (req: Request, res: Response
     }
 
     const json = assignment.toJSON() as unknown as AssignmentResponse;
-    if (req.user?.role === "student") {
-      json.submissionStatus = "NOT_SUBMITTED";
+    if (req.user?.role === "student" && req.user?._id) {
+      const studentSub = await Submission.findOne({
+        studentRef: req.user._id,
+        $or: [{ assignmentId: id }, { assignmentRef: assignment._id }],
+      }).sort({ submittedAt: -1 });
+
+      json.submissionStatus = studentSub?.status || "NOT_SUBMITTED";
+      json.submissionId = studentSub ? (studentSub.submissionId || studentSub._id.toString()) : null;
     }
 
     res.status(200).json(json);
