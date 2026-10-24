@@ -14,12 +14,22 @@ export interface ActivityItem {
 }
 
 // GET /api/activities - Feed of recent coursework and integrity activities
-activityRouter.get("/", authenticateJWT, async (_req: Request, res: Response): Promise<void> => {
+activityRouter.get("/", authenticateJWT, async (req: Request, res: Response): Promise<void> => {
   try {
-    const activities: ActivityItem[] = [];
+    if (!req.user) {
+      res.status(401).json({ message: "Unauthorized" });
+      return;
+    }
 
-    // Fetch recent submissions
-    const recentSubmissions = await Submission.find().sort({ submittedAt: -1 }).limit(5);
+    const activities: ActivityItem[] = [];
+    const isStudent = req.user.role === "student";
+
+    // Submissions query scoped to authenticated student if role is student
+    const submissionFilter = isStudent ? { studentRef: req.user._id } : {};
+    const recentSubmissions = await Submission.find(submissionFilter)
+      .sort({ submittedAt: -1 })
+      .limit(isStudent ? 10 : 5);
+
     for (const sub of recentSubmissions) {
       if (sub.status === "VERIFIED") {
         activities.push({

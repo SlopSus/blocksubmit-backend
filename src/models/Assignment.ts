@@ -1,6 +1,6 @@
 import mongoose, { Document, Schema } from "mongoose";
 
-export type AssignmentStatus = "ACTIVE" | "CLOSED" | "DRAFT";
+export type AssignmentStatus = "ACTIVE" | "CLOSED" | "ARCHIVED" | "DRAFT";
 
 export interface IAssignment extends Document {
   id: string;
@@ -52,8 +52,8 @@ const assignmentSchema = new Schema<IAssignment>(
     status: {
       type: String,
       enum: {
-        values: ["ACTIVE", "CLOSED", "DRAFT"],
-        message: "Status must be ACTIVE, CLOSED, or DRAFT",
+        values: ["ACTIVE", "CLOSED", "ARCHIVED", "DRAFT"],
+        message: "Status must be ACTIVE, CLOSED, ARCHIVED, or DRAFT",
       },
       default: "ACTIVE",
     },

@@ -7,7 +7,11 @@ import mongoose from "mongoose";
 import { Submission, ISubmission } from "../models/Submission";
 import { Assignment } from "../models/Assignment";
 import { authenticateJWT, requireRole } from "../middleware/auth";
-import { getBlockchainService } from "../services/blockchainService";
+import {
+  getBlockchainService,
+  BlockchainInfrastructureError,
+  BlockchainRecordNotFoundError,
+} from "../services/blockchainService";
 
 export const submissionRouter = Router();
 
@@ -52,6 +56,7 @@ submissionRouter.post(
   requireRole("student"),
   uploadMiddleware,
   async (req: Request, res: Response): Promise<void> => {
+    let storagePath: string | null = null;
     try {
       const { assignmentId } = req.body;
       const file = req.file;
@@ -86,9 +91,29 @@ submissionRouter.post(
         return;
       }
 
+      // Check for existing submission by this student for this assignment
+      const existingSubmission = await Submission.findOne({
+        studentRef: req.user!._id,
+        $or: [{ assignmentId: assignment._id.toString() }, { assignmentRef: assignment._id }],
+      });
+
+      if (existingSubmission) {
+        res.status(409).json({
+          message: "You have already submitted a document for this assignment.",
+          submissionId: existingSubmission.submissionId,
+        });
+        return;
+      }
+
       // Check assignment deadline
       if (new Date(assignment.deadline).getTime() <= Date.now()) {
         res.status(400).json({ message: "Assignment deadline has passed. Submissions are closed." });
+        return;
+      }
+
+      // Check assignment status
+      if (assignment.status === "CLOSED" || assignment.status === "ARCHIVED" || assignment.status === "DRAFT") {
+        res.status(400).json({ message: `Submissions are closed for this assignment (status: ${assignment.status}).` });
         return;
       }
 
@@ -104,7 +129,7 @@ submissionRouter.post(
         fs.mkdirSync(uploadDir, { recursive: true });
       }
 
-      const storagePath = path.join(uploadDir, `${submissionId}.pdf`);
+      storagePath = path.join(uploadDir, `${submissionId}.pdf`);
       fs.writeFileSync(storagePath, file.buffer);
 
       // Record on smart contract
@@ -115,8 +140,9 @@ submissionRouter.post(
         proofResult = await blockchainService.recordSubmission(submissionId, documentHash);
       } catch (chainError) {
         // Clean up file if blockchain transaction fails
-        if (fs.existsSync(storagePath)) {
+        if (storagePath && fs.existsSync(storagePath)) {
           fs.unlinkSync(storagePath);
+          storagePath = null;
         }
         const msg = chainError instanceof Error ? chainError.message : "Blockchain transaction failed";
         res.status(502).json({
@@ -126,8 +152,9 @@ submissionRouter.post(
       }
 
       if (!proofResult || proofResult.status !== "CONFIRMED") {
-        if (fs.existsSync(storagePath)) {
+        if (storagePath && fs.existsSync(storagePath)) {
           fs.unlinkSync(storagePath);
+          storagePath = null;
         }
         res.status(502).json({
           message: "Blockchain transaction did not receive a confirmed receipt.",
@@ -168,7 +195,22 @@ submissionRouter.post(
       await Assignment.findByIdAndUpdate(assignment._id, { $inc: { submissionCount: 1 } });
 
       res.status(201).json(submission.toJSON());
-    } catch (error) {
+    } catch (error: any) {
+      if (storagePath && fs.existsSync(storagePath)) {
+        try {
+          fs.unlinkSync(storagePath);
+        } catch {
+          // ignore cleanup errors
+        }
+      }
+
+      if (error?.code === 11000) {
+        res.status(409).json({
+          message: "You have already submitted a document for this assignment.",
+        });
+        return;
+      }
+
       const message = error instanceof Error ? error.message : "Submission processing failed";
       res.status(500).json({ message });
     }
@@ -299,15 +341,59 @@ submissionRouter.post(
       const currentBytes = fs.readFileSync(submission.storagePath);
       const currentHash = crypto.createHash("sha256").update(currentBytes).digest("hex");
 
-      // Verify on-chain record via contract view function
+      // 1. Calculate document integrity independently:
+      // Compare the calculated PDF hash directly with the trusted submission hash.
+      const isFileHashMatch = currentHash === submission.trustedHash;
+
+      // Rule: Mark the document TAMPERED only when the calculated PDF hash genuinely differs from trusted hash.
+      if (!isFileHashMatch) {
+        submission.status = "TAMPERED";
+        submission.currentHash = currentHash;
+        submission.hashMatch = false;
+        await submission.save();
+
+        res.status(200).json(submission.toJSON());
+        return;
+      }
+
+      // 2. The PDF hash is authentic (matches trustedHash). Verify against the blockchain.
       const blockchainService = getBlockchainService();
-      const isBlockchainMatch = await blockchainService.verifyHash(submission.submissionId, currentHash);
+      let isBlockchainMatch = false;
 
-      const isMatch = isBlockchainMatch && currentHash === submission.trustedHash;
+      try {
+        isBlockchainMatch = await blockchainService.verifyHash(submission.submissionId, currentHash);
+      } catch (chainError) {
+        if (chainError instanceof BlockchainRecordNotFoundError) {
+          // A missing submission on the current chain must not be interpreted as document tampering.
+          res.status(404).json({
+            message: `Blockchain verification failed: ${chainError.message}`,
+            error: "BLOCKCHAIN_RECORD_NOT_FOUND",
+          });
+          return;
+        }
 
-      submission.status = isMatch ? "VERIFIED" : "TAMPERED";
+        const msg = chainError instanceof Error ? chainError.message : "Blockchain service error";
+        res.status(502).json({
+          message: `Blockchain verification service unavailable: ${msg}`,
+          error: "BLOCKCHAIN_UNAVAILABLE",
+        });
+        return;
+      }
+
+      // 3. A contract call that explicitly returns false is preserved distinctly from an RPC failure.
+      // Not VERIFIED, but not falsely classified as document tampering.
+      if (!isBlockchainMatch) {
+        res.status(409).json({
+          message: "Blockchain verification failed: on-chain record does not match the document hash.",
+          error: "BLOCKCHAIN_HASH_MISMATCH",
+        });
+        return;
+      }
+
+      // 4. Document hash matches AND blockchain verification succeeded.
+      submission.status = "VERIFIED";
       submission.currentHash = currentHash;
-      submission.hashMatch = isMatch;
+      submission.hashMatch = true;
 
       await submission.save();
 

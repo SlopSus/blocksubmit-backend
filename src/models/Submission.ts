@@ -161,6 +161,25 @@ const submissionSchema = new Schema<ISubmission>(
 );
 
 submissionSchema.index({ submissionId: 1 }, { unique: true });
-submissionSchema.index({ studentRef: 1, assignmentId: 1 });
+submissionSchema.index(
+  { studentRef: 1, assignmentId: 1 },
+  {
+    unique: true,
+    partialFilterExpression: {
+      studentRef: { $exists: true },
+      assignmentId: { $exists: true, $type: "string" },
+    },
+  }
+);
+submissionSchema.index(
+  { studentRef: 1, assignmentRef: 1 },
+  {
+    unique: true,
+    partialFilterExpression: {
+      studentRef: { $exists: true },
+      assignmentRef: { $exists: true, $type: "objectId" },
+    },
+  }
+);
 
 export const Submission = mongoose.model<ISubmission>("Submission", submissionSchema);

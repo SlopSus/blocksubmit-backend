@@ -9,12 +9,17 @@ import mongoose from "mongoose";
 import { app } from "../src/app";
 import { User } from "../src/models/User";
 import { Submission } from "../src/models/Submission";
+import { Assignment } from "../src/models/Assignment";
 import { requireRole } from "../src/middleware/auth";
 import {
   IBlockchainService,
   BlockchainRecordResult,
+  BlockchainInfrastructureError,
+  BlockchainRecordNotFoundError,
   setBlockchainService,
+  BlockchainService,
 } from "../src/services/blockchainService";
+import { AbiCoder, id } from "ethers";
 
 describe("PDF Magic Byte Validation & Hashing", () => {
   it("detects valid PDF magic bytes (%PDF-)", () => {
@@ -160,6 +165,123 @@ describe("Blockchain Service Failure & Mock Behavior", () => {
     assert.strictEqual(await mockSuccessService.verifyHash("sub-test", "matching-hash"), true);
     // Tampered verifyHash
     assert.strictEqual(await mockSuccessService.verifyHash("sub-test", "mismatched-hash"), false);
+  });
+});
+
+describe("BlockchainService.recordSubmission Contract Bytecode & Event Verification", () => {
+  it("throws BlockchainInfrastructureError and sends no transaction when contract bytecode is missing", async () => {
+    const dummyKey = "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80";
+    const dummyAddress = "0x5FbDB2315678afecb367f032d93F642f64180aa3";
+    const service = new BlockchainService("http://127.0.0.1:8545", dummyAddress, dummyKey);
+
+    let txSent = false;
+    (service as any).provider = {
+      getCode: async () => "0x",
+    };
+    (service as any).contract = {
+      recordSubmission: async () => {
+        txSent = true;
+        return { wait: async () => ({ status: 1, logs: [] }) };
+      },
+      interface: (service as any).contract.interface,
+    };
+
+    await assert.rejects(
+      async () => {
+        await service.recordSubmission(
+          "sub-undeployed-1",
+          "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+      },
+      (err: any) => {
+        assert(err instanceof BlockchainInfrastructureError);
+        assert.match(err.message, /Smart contract is not deployed/i);
+        return true;
+      }
+    );
+
+    assert.strictEqual(txSent, false, "No transaction must be sent when bytecode is missing");
+  });
+
+  it("never accepts empty-address transaction as valid proof when no contract events are emitted", async () => {
+    const dummyKey = "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80";
+    const dummyAddress = "0x5FbDB2315678afecb367f032d93F642f64180aa3";
+    const service = new BlockchainService("http://127.0.0.1:8545", dummyAddress, dummyKey);
+
+    // Simulate getCode returning non-empty bytecode (or bypassed)
+    // but receipt has status: 1 and logs: [] (as happens with EVM call to address without contract bytecode)
+    (service as any).provider = {
+      getCode: async () => "0x60806040",
+    };
+    (service as any).contract = {
+      recordSubmission: async () => ({
+        wait: async () => ({
+          status: 1,
+          hash: "0xemptyaddresstxreceipt",
+          blockNumber: 1,
+          logs: [], // Empty logs from EVM call to empty address
+        }),
+      }),
+      interface: (service as any).contract.interface,
+    };
+
+    await assert.rejects(
+      async () => {
+        await service.recordSubmission(
+          "sub-empty-2",
+          "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+      },
+      (err: any) => {
+        assert(err instanceof BlockchainInfrastructureError);
+        assert.match(err.message, /contract event 'SubmissionRecorded' was not emitted/i);
+        return true;
+      }
+    );
+  });
+
+  it("resolves CONFIRMED status only when genuine contract recording emits SubmissionRecorded event", async () => {
+    const dummyKey = "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80";
+    const dummyAddress = "0x5FbDB2315678afecb367f032d93F642f64180aa3";
+    const service = new BlockchainService("http://127.0.0.1:8545", dummyAddress, dummyKey);
+
+    const docHash = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+    const submissionId = "sub-genuine-3";
+    const blockTime = 1792825000;
+
+    const iface = (service as any).contract.interface;
+    const event = iface.getEvent("SubmissionRecorded");
+    const data = AbiCoder.defaultAbiCoder().encode(["string", "uint256"], [docHash, blockTime]);
+    const validLog = {
+      topics: [
+        event.topicHash,
+        id(submissionId),
+        "0x000000000000000000000000f39fd6e51aad88f6f4ce6ab8827279cfffb92266",
+      ],
+      data,
+    };
+
+    (service as any).provider = {
+      getCode: async () => "0x608060405234801561001057600080fd5b50",
+      getBlock: async () => ({ timestamp: blockTime }),
+    };
+    (service as any).contract = {
+      recordSubmission: async () => ({
+        wait: async () => ({
+          status: 1,
+          hash: "0xgenuinetxhash789",
+          blockNumber: 42,
+          logs: [validLog],
+        }),
+      }),
+      interface: iface,
+    };
+
+    const result = await service.recordSubmission(submissionId, docHash);
+    assert.strictEqual(result.status, "CONFIRMED");
+    assert.strictEqual(result.transactionHash, "0xgenuinetxhash789");
+    assert.strictEqual(result.blockNumber, 42);
+    assert.strictEqual(result.timestamp, new Date(blockTime * 1000).toISOString());
   });
 });
 
@@ -686,4 +808,416 @@ describe("POST /api/submissions/:id/verify - Tamper Detection & Integrity Verifi
     assert.strictEqual(mockDoc.hashMatch, false);
     assert.strictEqual(mockDoc.currentHash, expectedTamperedHash);
   });
+
+  it("Scenario 3: Matching PDF hash + RPC/network error -> 502 infrastructure error, persisted status unchanged", async () => {
+    const subId = "sub-test-rpc-outage-regression";
+    const tempPdfPath = path.join(testUploadDir, `${subId}.pdf`);
+    tempFilesToClean.add(tempPdfPath);
+
+    const pdfBytes = Buffer.from("%PDF-1.4 Authentic Academic Paper - Network Outage Test");
+    const trustedHash = crypto.createHash("sha256").update(pdfBytes).digest("hex");
+    fs.writeFileSync(tempPdfPath, pdfBytes);
+
+    const mockDoc = new Submission({
+      submissionId: subId,
+      student: {
+        id: new mongoose.Types.ObjectId().toString(),
+        name: "Test Student",
+        email: "student@blocksubmit.edu",
+        initials: "TS",
+      },
+      studentRef: new mongoose.Types.ObjectId(),
+      assignmentId: new mongoose.Types.ObjectId().toString(),
+      assignmentRef: new mongoose.Types.ObjectId(),
+      assignmentTitle: "Network Outage Test Assignment",
+      documentName: "network_test_paper.pdf",
+      storagePath: tempPdfPath,
+      fileSize: pdfBytes.length,
+      submittedAt: new Date("2026-10-23T20:00:00.000Z"),
+      status: "PENDING",
+      trustedHash,
+      currentHash: null,
+      hashMatch: null,
+      proof: {
+        transactionHash: "0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef",
+        blockNumber: 44,
+        timestamp: "2026-10-23T20:01:00.000Z",
+        status: "CONFIRMED",
+      },
+    });
+
+    let saveCalled = false;
+    mockDoc.save = async function () {
+      saveCalled = true;
+      return this;
+    };
+    activeMockSubmission = mockDoc;
+
+    // Mock failing RPC service
+    const mockFailingRpcService: IBlockchainService = {
+      recordSubmission: async () => ({
+        transactionHash: "0x1234",
+        blockNumber: 44,
+        timestamp: new Date().toISOString(),
+        status: "CONFIRMED",
+      }),
+      verifyHash: async () => {
+        throw new BlockchainInfrastructureError("Failed to connect to blockchain RPC at http://127.0.0.1:8545: connect ECONNREFUSED");
+      },
+      getSubmission: async () => null,
+    };
+    setBlockchainService(mockFailingRpcService);
+
+    const res = await fetch(`${baseUrl}/api/submissions/${subId}/verify`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${professorToken}` },
+    });
+
+    assert.strictEqual(res.status, 502);
+    const body = await res.json();
+    assert.strictEqual(body.error, "BLOCKCHAIN_UNAVAILABLE");
+    assert.match(body.message, /service unavailable/i);
+
+    // Assert existing persisted status was NOT changed to TAMPERED and save was not called
+    assert.strictEqual(saveCalled, false);
+    assert.strictEqual(mockDoc.status, "PENDING");
+    assert.strictEqual(mockDoc.hashMatch, null);
+  });
+
+  it("Scenario 4: Matching PDF hash + missing contract code -> 502 error, no false TAMPERED update", async () => {
+    const subId = "sub-test-missing-contract-regression";
+    const tempPdfPath = path.join(testUploadDir, `${subId}.pdf`);
+    tempFilesToClean.add(tempPdfPath);
+
+    const pdfBytes = Buffer.from("%PDF-1.4 Authentic Academic Paper - Undeployed Contract Test");
+    const trustedHash = crypto.createHash("sha256").update(pdfBytes).digest("hex");
+    fs.writeFileSync(tempPdfPath, pdfBytes);
+
+    const mockDoc = new Submission({
+      submissionId: subId,
+      student: {
+        id: new mongoose.Types.ObjectId().toString(),
+        name: "Test Student",
+        email: "student@blocksubmit.edu",
+        initials: "TS",
+      },
+      studentRef: new mongoose.Types.ObjectId(),
+      assignmentId: new mongoose.Types.ObjectId().toString(),
+      assignmentRef: new mongoose.Types.ObjectId(),
+      assignmentTitle: "Missing Contract Test Assignment",
+      documentName: "missing_contract_paper.pdf",
+      storagePath: tempPdfPath,
+      fileSize: pdfBytes.length,
+      submittedAt: new Date("2026-10-23T20:00:00.000Z"),
+      status: "PENDING",
+      trustedHash,
+      currentHash: null,
+      hashMatch: null,
+      proof: {
+        transactionHash: "0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef",
+        blockNumber: 45,
+        timestamp: "2026-10-23T20:01:00.000Z",
+        status: "CONFIRMED",
+      },
+    });
+
+    let saveCalled = false;
+    mockDoc.save = async function () {
+      saveCalled = true;
+      return this;
+    };
+    activeMockSubmission = mockDoc;
+
+    const mockUndeployedContractService: IBlockchainService = {
+      recordSubmission: async () => ({
+        transactionHash: "0x1234",
+        blockNumber: 45,
+        timestamp: new Date().toISOString(),
+        status: "CONFIRMED",
+      }),
+      verifyHash: async () => {
+        throw new BlockchainInfrastructureError("Smart contract is not deployed at address 0x5FbDB... on the connected blockchain network");
+      },
+      getSubmission: async () => null,
+    };
+    setBlockchainService(mockUndeployedContractService);
+
+    const res = await fetch(`${baseUrl}/api/submissions/${subId}/verify`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${professorToken}` },
+    });
+
+    assert.strictEqual(res.status, 502);
+    const body = await res.json();
+    assert.strictEqual(body.error, "BLOCKCHAIN_UNAVAILABLE");
+
+    // No false TAMPERED update
+    assert.strictEqual(saveCalled, false);
+    assert.strictEqual(mockDoc.status, "PENDING");
+    assert.notStrictEqual(mockDoc.status, "TAMPERED");
+    assert.strictEqual(mockDoc.hashMatch, null);
+  });
+
+  it("Scenario 5: Matching PDF hash + explicit negative blockchain result -> 409 conflict, not VERIFIED and not TAMPERED", async () => {
+    const subId = "sub-test-negative-blockchain-result";
+    const tempPdfPath = path.join(testUploadDir, `${subId}.pdf`);
+    tempFilesToClean.add(tempPdfPath);
+
+    const pdfBytes = Buffer.from("%PDF-1.4 Authentic Academic Paper - Explicit Negative Chain Result");
+    const trustedHash = crypto.createHash("sha256").update(pdfBytes).digest("hex");
+    fs.writeFileSync(tempPdfPath, pdfBytes);
+
+    const mockDoc = new Submission({
+      submissionId: subId,
+      student: {
+        id: new mongoose.Types.ObjectId().toString(),
+        name: "Test Student",
+        email: "student@blocksubmit.edu",
+        initials: "TS",
+      },
+      studentRef: new mongoose.Types.ObjectId(),
+      assignmentId: new mongoose.Types.ObjectId().toString(),
+      assignmentRef: new mongoose.Types.ObjectId(),
+      assignmentTitle: "Explicit False Test Assignment",
+      documentName: "explicit_false_paper.pdf",
+      storagePath: tempPdfPath,
+      fileSize: pdfBytes.length,
+      submittedAt: new Date("2026-10-23T20:00:00.000Z"),
+      status: "PENDING",
+      trustedHash,
+      currentHash: null,
+      hashMatch: null,
+      proof: {
+        transactionHash: "0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef",
+        blockNumber: 46,
+        timestamp: "2026-10-23T20:01:00.000Z",
+        status: "CONFIRMED",
+      },
+    });
+
+    let saveCalled = false;
+    mockDoc.save = async function () {
+      saveCalled = true;
+      return this;
+    };
+    activeMockSubmission = mockDoc;
+
+    // Explicit false returned by contract view function
+    const mockExplicitFalseService: IBlockchainService = {
+      recordSubmission: async () => ({
+        transactionHash: "0x1234",
+        blockNumber: 46,
+        timestamp: new Date().toISOString(),
+        status: "CONFIRMED",
+      }),
+      verifyHash: async () => {
+        return false; // Contract executed and returned false
+      },
+      getSubmission: async () => null,
+    };
+    setBlockchainService(mockExplicitFalseService);
+
+    const res = await fetch(`${baseUrl}/api/submissions/${subId}/verify`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${professorToken}` },
+    });
+
+    // Explicit false should return 409 and not 502
+    // Explicit false should return 409 and not 502
+    assert.strictEqual(res.status, 409);
+    const body = await res.json();
+    assert.strictEqual(body.error, "BLOCKCHAIN_HASH_MISMATCH");
+
+    // Status must NOT be VERIFIED and must NOT be falsely classified as TAMPERED
+    assert.strictEqual(saveCalled, false);
+    assert.strictEqual(mockDoc.status, "PENDING");
+    assert.notStrictEqual(mockDoc.status, "VERIFIED");
+    assert.notStrictEqual(mockDoc.status, "TAMPERED");
+    assert.strictEqual(mockDoc.hashMatch, null);
+  });
 });
+
+describe("POST /api/submissions - Duplicate Submission Protection", () => {
+  let server: Server;
+  let baseUrl: string;
+  const testSecret = "test-jwt-secret-for-duplicate-submission";
+  const studentId = new mongoose.Types.ObjectId();
+  const assignmentId = new mongoose.Types.ObjectId();
+  let studentToken: string;
+
+  const originalUserFindById = User.findById;
+  const originalAssignmentFindById = Assignment.findById;
+  const originalSubmissionFindOne = Submission.findOne;
+  const originalSubmissionCreate = Submission.create;
+
+  before(() => {
+    process.env.JWT_SECRET = testSecret;
+
+    studentToken = jwt.sign(
+      { id: studentId.toString(), email: "student@blocksubmit.edu", role: "student" },
+      testSecret,
+      { expiresIn: "1h" }
+    );
+
+    User.findById = ((id: any) => {
+      if (id && id.toString() === studentId.toString()) {
+        return Promise.resolve({
+          _id: studentId,
+          role: "student",
+          email: "student@blocksubmit.edu",
+          name: "Test Student",
+          initials: "TS",
+        });
+      }
+      return Promise.resolve(null);
+    }) as any;
+
+    Assignment.findById = ((id: any) => {
+      if (id && id.toString() === assignmentId.toString()) {
+        return Promise.resolve({
+          _id: assignmentId,
+          title: "Operating Systems Final Project",
+          deadline: new Date(Date.now() + 86400000), // future deadline
+        });
+      }
+      return Promise.resolve(null);
+    }) as any;
+
+    return new Promise((resolve) => {
+      server = app.listen(0, () => {
+        const addr = server.address();
+        if (addr && typeof addr === "object") {
+          baseUrl = `http://127.0.0.1:${addr.port}`;
+        }
+        resolve();
+      });
+    });
+  });
+
+  after(() => {
+    User.findById = originalUserFindById;
+    Assignment.findById = originalAssignmentFindById;
+    Submission.findOne = originalSubmissionFindOne;
+    Submission.create = originalSubmissionCreate;
+    setBlockchainService(null);
+
+    return new Promise((resolve) => {
+      server.close(() => resolve());
+    });
+  });
+
+  it("rejects duplicate submission with 409 Conflict when student has an existing submission", async () => {
+    Submission.findOne = (() => {
+      return Promise.resolve({
+        submissionId: "sub-already-submitted-999",
+      });
+    }) as any;
+
+    const formData = new FormData();
+    formData.append("assignmentId", assignmentId.toString());
+    const validPdfBytes = Buffer.from("%PDF-1.4 duplicate test content");
+    formData.append("document", new Blob([validPdfBytes], { type: "application/pdf" }), "dup.pdf");
+
+    const res = await fetch(`${baseUrl}/api/submissions`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${studentToken}` },
+      body: formData,
+    });
+
+    assert.strictEqual(res.status, 409);
+    const body = await res.json();
+    assert.match(body.message, /already submitted a document/i);
+    assert.strictEqual(body.submissionId, "sub-already-submitted-999");
+  });
+
+  it("handles concurrent submission race condition (MongoDB E11000 duplicate key error) with 409 Conflict", async () => {
+    // Pre-check passes (simulating concurrent arrival)
+    Submission.findOne = (() => Promise.resolve(null)) as any;
+
+    // Mock blockchain service to return confirmed proof
+    setBlockchainService({
+      recordSubmission: async () => ({
+        transactionHash: "0xconcurrenttx",
+        blockNumber: 42,
+        timestamp: new Date().toISOString(),
+        status: "CONFIRMED",
+      }),
+      verifyHash: async () => true,
+      getSubmission: async () => null,
+    });
+
+    // Submission.create throws MongoDB 11000 duplicate key error
+    Submission.create = (() => {
+      const err = new Error(
+        "E11000 duplicate key error collection: blocksubmit.submissions index: studentRef_1_assignmentRef_1 dup key"
+      );
+      (err as any).code = 11000;
+      return Promise.reject(err);
+    }) as any;
+
+    const formData = new FormData();
+    formData.append("assignmentId", assignmentId.toString());
+    const validPdfBytes = Buffer.from("%PDF-1.4 concurrent test content");
+    formData.append("document", new Blob([validPdfBytes], { type: "application/pdf" }), "race.pdf");
+
+    const res = await fetch(`${baseUrl}/api/submissions`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${studentToken}` },
+      body: formData,
+    });
+
+    assert.strictEqual(res.status, 409);
+    const body = await res.json();
+    assert.match(body.message, /already submitted a document/i);
+  });
+
+  it("returns 502 Bad Gateway, unlinks uploaded file, and aborts persistence when blockchain recording fails", async () => {
+    // Pre-check passes
+    Submission.findOne = (() => Promise.resolve(null)) as any;
+
+    // Mock blockchain service to throw BlockchainInfrastructureError
+    setBlockchainService({
+      recordSubmission: async () => {
+        throw new BlockchainInfrastructureError(
+          "Smart contract is not deployed at address 0x5FbDB2315678afecb367f032d93F642f64180aa3"
+        );
+      },
+      verifyHash: async () => false,
+      getSubmission: async () => null,
+    });
+
+    let createdDocument: any = null;
+    Submission.create = ((doc: any) => {
+      createdDocument = doc;
+      return Promise.resolve(doc);
+    }) as any;
+
+    const uploadsDir = process.env.UPLOAD_DIR || path.join(process.cwd(), "uploads");
+    const beforeFiles = fs.existsSync(uploadsDir) ? fs.readdirSync(uploadsDir) : [];
+
+    const formData = new FormData();
+    formData.append("assignmentId", assignmentId.toString());
+    const validPdfBytes = Buffer.from("%PDF-1.4 file that should be cleaned up on blockchain failure");
+    formData.append("document", new Blob([validPdfBytes], { type: "application/pdf" }), "failed_tx.pdf");
+
+    const res = await fetch(`${baseUrl}/api/submissions`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${studentToken}` },
+      body: formData,
+    });
+
+    assert.strictEqual(res.status, 502);
+    const body = await res.json();
+    assert.match(body.message, /Failed to record submission proof on blockchain/i);
+    assert.match(body.message, /Smart contract is not deployed/i);
+    assert.strictEqual(createdDocument, null, "Submission.create must not be called when blockchain fails");
+
+    const afterFiles = fs.existsSync(uploadsDir) ? fs.readdirSync(uploadsDir) : [];
+    assert.deepStrictEqual(
+      afterFiles,
+      beforeFiles,
+      "Uploaded file must be cleaned up on failure, leaving no orphan files"
+    );
+  });
+});
+
